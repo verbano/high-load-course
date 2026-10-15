@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -22,6 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -42,6 +45,12 @@ class PaymentExternalSystemAdapterImpl(
     }, true)
 
     private val client = OkHttpClient.Builder().build()
+    private val paymentCallTimers = listOf("success", "failure", "error").associateWith { outcome ->
+        Timer.builder("payment.provider.call.duration")
+            .description("Payment provider HTTP call duration, excluding local queueing and database updates")
+            .tags("service", serviceName, "accountName", accountName, "outcome", outcome)
+            .register(meterRegistry)
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -121,21 +130,30 @@ class PaymentExternalSystemAdapterImpl(
             }
             val call = client.newCall(request)
             call.timeout().timeout(remaining, TimeUnit.MILLISECONDS)
-            call.execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Invalid payment response for txId: $transactionId, payment: $paymentId, result code: ${response.code}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            val sample = Timer.start(meterRegistry)
+            var outcome = "error"
+            val body = try {
+                call.execute().use { response ->
+                    try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java).also {
+                            outcome = if (response.isSuccessful && it.result) "success" else "failure"
+                        }
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] Invalid payment response for txId: $transactionId, payment: $paymentId, result code: ${response.code}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    }
                 }
+            } finally {
+                sample.stop(paymentCallTimers.getValue(outcome))
+            }
+
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
             }
         } catch (e: Exception) {
             when (e) {
